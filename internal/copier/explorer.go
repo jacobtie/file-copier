@@ -6,8 +6,10 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/jacobtie/file-copier/internal/concurrency"
 	"github.com/jacobtie/file-copier/internal/ds"
 	"github.com/jacobtie/file-copier/internal/functional"
 )
@@ -37,14 +39,50 @@ func (e *explorer) explore() error {
 	}
 	e.outputDir = outputDirPath // overwrite with created subdir
 	e.queue.Enqueue(e.sourceDir)
-	for !e.queue.IsEmpty() {
+	semaphore := concurrency.NewSemaphore(e.numWorkers)
+	var firstError error
+	var firstErrorMutex sync.Mutex
+	var wg sync.WaitGroup
+	numRunning := 0
+	var numRunningMutex sync.Mutex
+	for !e.queue.IsEmpty() || numRunning > 0 {
+		semaphore.Lock()
+		if e.queue.IsEmpty() {
+			semaphore.Unlock()
+			continue
+		}
 		nextSubDir, err := e.queue.Dequeue()
 		if err != nil {
-			return fmt.Errorf("an unexpected error occured: %w", err)
+			firstErrorMutex.Lock()
+			firstError = fmt.Errorf("an unexpected error occured: %w", err)
+			firstErrorMutex.Unlock()
+			break
 		}
-		if err := e.exploreSubDir(nextSubDir); err != nil {
-			return fmt.Errorf("failed to explore subdir %s: %w", nextSubDir, err)
+		wg.Add(1)
+		numRunningMutex.Lock()
+		numRunning++
+		numRunningMutex.Unlock()
+		go func(subDir string) {
+			defer func() {
+				wg.Done()
+				numRunningMutex.Lock()
+				numRunning--
+				numRunningMutex.Unlock()
+			}()
+			if err := e.exploreSubDir(nextSubDir); err != nil {
+				firstErrorMutex.Lock()
+				firstError = fmt.Errorf("failed to explore subdir %s: %w", nextSubDir, err)
+				firstErrorMutex.Unlock()
+			}
+		}(nextSubDir)
+		semaphore.Unlock()
+		if firstError != nil {
+			break
 		}
+	}
+	wg.Wait()
+	if firstError != nil {
+		return firstError
 	}
 	return nil
 }
